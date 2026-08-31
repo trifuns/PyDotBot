@@ -14,9 +14,9 @@ import threading
 import time
 from dataclasses import dataclass
 from enum import Enum
-from math import atan2, cos, pi, sin, sqrt
+from math import atan2, cos, hypot, pi, sin, sqrt
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Tuple
 
 import toml
 from dotbot_utils.protocol import Frame, Header, Packet
@@ -28,6 +28,7 @@ from dotbot import (
     addr_to_hex,
 )
 from dotbot.logger import LOGGER
+from dotbot.mari_schedules import MariSchedule, load_schedules, select_schedule
 from dotbot.protocol import ControlModeType, PayloadDotBotAdvertisement, PayloadType
 
 Kv = 700  # motor speed constant in RPM
@@ -55,9 +56,13 @@ MAX_BATTERY_DURATION = 60 * 60 * 3  # 3 hours in seconds
 ADVERTISEMENT_INTERVAL_S = 0.5
 SIMULATOR_UPDATE_INTERVAL_S = 0.05
 
-MARI_SLOTFRAME_SIZE = (
-    102  # fixed schedule size; slotframe ≈ 126 ms → avg latency ≈ 63 ms
-)
+# Round-trip latency an empirical mari hardware campaign measured (p50, ms) at
+# each schedule's full node capacity. MariNetworkSimulator derives a small
+# additive per-direction overhead from these against the per-cell wait its own
+# schedule model computes (never a negative one — the overhead only fills a
+# gap the theoretical wait underestimates). A starting calibration; a future
+# hardware campaign may revise it.
+MARI_MEASURED_RTT_P50_MS = {"tiny": 40.0, "medium": 96.0, "big": 146.0, "huge": 233.0}
 
 # Feature order must match utils/sim_to_real/train_gru.py FEATURE_COLS
 GRU_FEATURE_COLS = [
@@ -104,8 +109,30 @@ class SimulatedNetworkSettings(BaseModel):
     pdr: int = 100
     uplink_pdr: Optional[int] = None
     downlink_pdr: Optional[int] = None
-    slot_duration_ms: float = 1.236
+    # None = derive from the mari schedule the fleet size selects (firmware
+    # mac.h, computed rather than hand-copied — see dotbot.mari_schedules).
+    slot_duration_ms: Optional[float] = None
     mqtt_latency_ms: float = 0.0
+    # None = auto-select the smallest mari schedule that fits the fleet size
+    # ("tiny"/"medium"/"big"/"huge"); set to force one explicitly.
+    schedule: Optional[str] = None
+    # Explicit mari firmware checkout to parse schedules/timing from; None
+    # resolves via $MARI_FIRMWARE_DIR or a sibling `mari/` directory, falling
+    # back to the bundled generated snapshot if neither is found.
+    mari_dir: Optional[str] = None
+    # Gateway position in mm, arena coordinates — the reference point distance
+    # is measured from for pdr_by_distance_m.
+    gateway_pos_x: int = 1000
+    gateway_pos_y: int = 1000
+    # [[distance_m, pdr_percent], ...] anchors, linearly interpolated (clamped
+    # outside the range) to derive per-bot PDR from its distance to the
+    # gateway. None falls back to the flat pdr/uplink_pdr/downlink_pdr above.
+    # Deliberately never a function of node count or schedule size — an
+    # empirical mari hardware campaign found PDR tracks distance only; an
+    # apparent PDR-vs-schedule-size correlation in raw aggregates turned out
+    # to be a selection-bias artifact (smaller schedules fill with
+    # better-connected bots first), not a real swarm-size effect.
+    pdr_by_distance_m: Optional[List[Tuple[float, float]]] = None
 
     @model_validator(mode="after")
     def _fill_mari_pdrs(self):
@@ -670,17 +697,106 @@ class DotBotSimulator:
             self._control_ctx = None
 
 
-class MariNetworkSimulator:
-    """TSCH slot-based network simulator modelling the Mari link layer."""
+def _load_named_schedule(name: str, mari_dir: Optional[str]) -> MariSchedule:
+    schedules = load_schedules(mari_dir)
+    try:
+        return schedules[name]
+    except KeyError:
+        raise ValueError(f"unknown mari schedule {name!r}; have {sorted(schedules)}") from None
 
-    def __init__(self, settings: SimulatedNetworkSettings, on_frame_received: Callable):
+
+def _next_downlink_cell(after: int, downlink_cells: Tuple[int, ...]) -> int:
+    """The nearest downlink cell strictly after `after`.
+
+    Wraps to the first downlink cell of the next slotframe if none remain in
+    this one, mirroring the cyclic schedule.
+    """
+    for cell in downlink_cells:
+        if cell > after:
+            return cell
+    return downlink_cells[0]
+
+
+def _interpolate_pdr(distance_m: float, anchors: List[Tuple[float, float]]) -> int:
+    """Linear interpolation over (distance_m, pdr_percent) anchors, clamped at the ends."""
+    points = sorted(anchors, key=lambda p: p[0])
+    if distance_m <= points[0][0]:
+        return round(points[0][1])
+    if distance_m >= points[-1][0]:
+        return round(points[-1][1])
+    for (d0, p0), (d1, p1) in zip(points, points[1:]):
+        if d0 <= distance_m <= d1:
+            t = (distance_m - d0) / (d1 - d0)
+            return round(p0 + t * (p1 - p0))
+    return round(points[-1][1])  # unreachable — points is sorted and covers [d0, d_last]
+
+
+class MariNetworkSimulator:
+    """Discrete-event model of mari's TSCH link layer for the DotBot simulator.
+
+    Selects one of mari's real fixed schedules from the mari-mode fleet size
+    (or an explicit ``network.schedule`` override), assigns each mari-mode bot
+    a real dedicated uplink cell in schedule order, and delivers frames at the
+    delay to that bot's next assigned cell — a real ``U`` cell for uplink, the
+    nearest ``D`` cell after it for downlink. PDR is drawn per direction, per
+    delivery attempt (mari has no link-layer ACK/retransmission, so every
+    attempt is single-shot), from each bot's live distance to the gateway —
+    never from the fleet size or the schedule.
+    """
+
+    def __init__(
+        self,
+        settings: SimulatedNetworkSettings,
+        dotbots: List["DotBotSimulator"],
+        mari_indices: List[int],
+        on_frame_received: Callable,
+    ):
         self._settings = settings
+        self._dotbots = dotbots
         self._on_frame_received = on_frame_received
         self._heap: list = []
         self._seq = 0
         self._cond = threading.Condition()
         self._stop_event = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
+
+        self._schedule: MariSchedule = (
+            select_schedule(len(mari_indices), mari_dir=settings.mari_dir)
+            if settings.schedule is None
+            else _load_named_schedule(settings.schedule, settings.mari_dir)
+        )
+        if len(mari_indices) > self._schedule.max_nodes:
+            raise ValueError(
+                f"mari schedule {self._schedule.name!r} supports at most "
+                f"{self._schedule.max_nodes} nodes, but {len(mari_indices)} "
+                "dotbots are in mari mode"
+            )
+        self._slot_duration_ms = settings.slot_duration_ms or self._schedule.slot_duration_ms
+
+        uplink_cells = self._schedule.uplink_cell_indices()
+        downlink_cells = self._schedule.downlink_cell_indices()
+        self._uplink_cell = {index: uplink_cells[i] for i, index in enumerate(mari_indices)}
+        self._downlink_cell = {
+            index: _next_downlink_cell(uplink_cells[i], downlink_cells)
+            for i, index in enumerate(mari_indices)
+        }
+
+        overhead_s = self._calibrated_overhead_ms() / 1000
+        self._uplink_overhead_s = overhead_s
+        self._downlink_overhead_s = overhead_s
+
+    def _calibrated_overhead_ms(self) -> float:
+        """Extra per-direction delay an empirical mari campaign's measured RTT
+        implies beyond this schedule's own per-cell wait — never negative, so
+        calibration only ever fills a gap the theoretical wait underestimates,
+        never shortens it."""
+        measured_rtt_p50 = MARI_MEASURED_RTT_P50_MS.get(self._schedule.name)
+        if measured_rtt_p50 is None:
+            return 0.0
+        # Expected one-way wait for a uniformly-phased request to hit its
+        # assigned cell, averaged over a slotframe.
+        theoretical_one_way_p50 = self._schedule.slotframe_ms / 2
+        return max(0.0, measured_rtt_p50 / 2 - theoretical_one_way_p50)
 
     def start(self):
         self._thread.start()
@@ -691,14 +807,11 @@ class MariNetworkSimulator:
             self._cond.notify_all()
         self._thread.join()
 
-    def _slot_delay_s(self, dotbot_index: int, slot_shift: int = 0) -> float:
-        slotframe_duration_s = (
-            MARI_SLOTFRAME_SIZE * self._settings.slot_duration_ms / 1000
-        )
-        slot_pos = (dotbot_index + slot_shift) % MARI_SLOTFRAME_SIZE
-        slot_offset_s = slot_pos * self._settings.slot_duration_ms / 1000
-        phase = time.monotonic() % slotframe_duration_s
-        return (slot_offset_s - phase) % slotframe_duration_s
+    def _cell_delay_s(self, cell_index: int) -> float:
+        slotframe_s = self._schedule.slotframe_ms / 1000
+        cell_offset_s = cell_index * self._slot_duration_ms / 1000
+        phase = time.monotonic() % slotframe_s
+        return (cell_offset_s - phase) % slotframe_s
 
     def _enqueue(self, delay_s: float, fn: Callable):
         delivery = time.monotonic() + delay_s
@@ -707,21 +820,39 @@ class MariNetworkSimulator:
             self._seq += 1
             self._cond.notify()
 
+    def _pdr_percent(self, dotbot_index: int, flat_default: int) -> int:
+        anchors = self._settings.pdr_by_distance_m
+        if not anchors:
+            return flat_default
+        dotbot = self._dotbots[dotbot_index]
+        distance_m = (
+            hypot(
+                dotbot.pos_x - self._settings.gateway_pos_x,
+                dotbot.pos_y - self._settings.gateway_pos_y,
+            )
+            / 1000  # pos_x/pos_y are in mm
+        )
+        return _interpolate_pdr(distance_m, anchors)
+
     def schedule_uplink(self, frame, dotbot_index: int):
-        if random.randint(0, 100) > self._settings.uplink_pdr:
+        if random.randint(0, 100) > self._pdr_percent(dotbot_index, self._settings.uplink_pdr):
             return
-        delay = self._slot_delay_s(dotbot_index) + self._settings.mqtt_latency_ms / 1000
+        delay = (
+            self._cell_delay_s(self._uplink_cell[dotbot_index])
+            + self._uplink_overhead_s
+            + self._settings.mqtt_latency_ms / 1000
+        )
         self._enqueue(delay, lambda: self._on_frame_received(frame))
 
     def schedule_downlink(
         self, bytes_: bytes, dotbot: "DotBotSimulator", dotbot_index: int
     ):
-        if random.randint(0, 100) > self._settings.downlink_pdr:
+        if random.randint(0, 100) > self._pdr_percent(dotbot_index, self._settings.downlink_pdr):
             return
         frame = Frame.from_bytes(bytes_)
-        # Downlink slots are in the second half of the frame — distinct from uplink slots
         delay = (
-            self._slot_delay_s(dotbot_index, slot_shift=MARI_SLOTFRAME_SIZE // 2)
+            self._cell_delay_s(self._downlink_cell[dotbot_index])
+            + self._downlink_overhead_s
             + self._settings.mqtt_latency_ms / 1000
         )
         self._enqueue(delay, lambda: dotbot.queue.put_nowait(frame))
@@ -791,8 +922,16 @@ class DotBotSimulatorCommunicationInterface:
         self._dotbot_modes = [s.network_mode for s in init_state.dotbots]
         self._address_to_index = {d.address: i for i, d in enumerate(self.dotbots)}
         self._mari = None
-        if any(m == SimulatedNetworkMode.MARI for m in self._dotbot_modes):
-            self._mari = MariNetworkSimulator(self._network, self.on_frame_received)
+        mari_indices = [
+            i for i, m in enumerate(self._dotbot_modes) if m == SimulatedNetworkMode.MARI
+        ]
+        if mari_indices:
+            self._mari = MariNetworkSimulator(
+                settings=self._network,
+                dotbots=self.dotbots,
+                mari_indices=mari_indices,
+                on_frame_received=self.on_frame_received,
+            )
 
         self.logger = LOGGER.bind(context=__name__)
 

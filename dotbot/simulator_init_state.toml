@@ -3,10 +3,26 @@
 
 [network]
 pdr = 100              # packet delivery ratio for "default" network mode (0-100)
-uplink_pdr = 100       # PDR for DotBot→gateway direction in "mari" mode
-downlink_pdr = 100     # PDR for gateway→DotBot direction in "mari" mode
-slot_duration_ms = 1.236  # Mari TSCH slot duration in ms (from mac.h)
+uplink_pdr = 100       # flat fallback PDR for DotBot→gateway in "mari" mode, used
+                       # when pdr_by_distance_m below is unset
+downlink_pdr = 100     # flat fallback PDR for gateway→DotBot in "mari" mode
+# slot_duration_ms = 1.78  # optional override; default derives from the mari
+                           # schedule (firmware mac.h), not hand-copied here
 mqtt_latency_ms = 0.0  # one-way MQTT broker latency in ms (applied in both modes)
+# schedule = "big"     # optional: force one of mari's tiny/medium/big/huge
+                        # schedules; default auto-selects from the mari-mode
+                        # fleet size
+# mari_dir = "/path/to/mari"  # optional explicit mari firmware checkout;
+                               # default resolves $MARI_FIRMWARE_DIR, then a
+                               # sibling `mari/` directory, then a bundled
+                               # generated snapshot
+gateway_pos_x = 1000   # gateway position in mm, arena coordinates — the
+gateway_pos_y = 1000   # reference point pdr_by_distance_m measures from
+# pdr_by_distance_m = [[2.0, 98.6], [10.0, 94.3]]  # optional: derive per-bot
+                        # "mari" mode PDR from its live distance to the
+                        # gateway (linear interpolation, clamped outside the
+                        # range) instead of the flat uplink_pdr/downlink_pdr
+                        # above. Never a function of fleet size or schedule.
 
 [[dotbots]]
 address = "BADCAFE111111111" # DotBot unique address
