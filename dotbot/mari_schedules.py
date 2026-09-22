@@ -82,6 +82,9 @@ class MariSchedule:
     def downlink_cell_indices(self) -> tuple[int, ...]:
         return tuple(i for i, t in enumerate(self.cell_types) if t == DOWNLINK)
 
+    def shared_uplink_cell_indices(self) -> tuple[int, ...]:
+        return tuple(i for i, t in enumerate(self.cell_types) if t == SHARED_UPLINK)
+
 
 # ---------------------------------------------------------------- sources --
 # Resolution + comment-stripping, mirrored from

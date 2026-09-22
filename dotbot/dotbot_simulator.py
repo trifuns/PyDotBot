@@ -64,6 +64,33 @@ SIMULATOR_UPDATE_INTERVAL_S = 0.05
 # hardware campaign may revise it.
 MARI_MEASURED_RTT_P50_MS = {"tiny": 40.0, "medium": 96.0, "big": 146.0, "huge": 233.0}
 
+# Join/association backoff constants, from mari/firmware/mari/association.c —
+# a node contending for a shared uplink (S) cell doubles its backoff window
+# (as 2^n - 1 slots) after each collision, up to n=MARI_BACKOFF_N_MAX, and
+# gives up (rescans) after MARI_BACKOFF_MAX_STREAK consecutive collisions at
+# that max window.
+MARI_BACKOFF_N_MIN = 4
+MARI_BACKOFF_N_MAX = 6
+MARI_BACKOFF_MAX_STREAK = 3
+# association.c's MARI_JOINING_STATE_TIMEOUT is ~1.5 slot durations.
+MARI_JOINING_STATE_TIMEOUT_SLOTS = 1.5
+
+
+class MariJoinState(str, Enum):
+    IDLE = "idle"
+    SCANNING = "scanning"
+    SYNCED = "synced"
+    JOINING = "joining"
+    JOINED = "joined"
+
+
+@dataclass
+class _AssocNodeState:
+    state: MariJoinState = MariJoinState.IDLE
+    backoff_n: int = -1
+    backoff_remaining: int = 0
+    consecutive_max_backoff: int = 0
+
 # Feature order must match utils/sim_to_real/train_gru.py FEATURE_COLS
 GRU_FEATURE_COLS = [
     "pwm_left",
@@ -734,56 +761,65 @@ def _interpolate_pdr(distance_m: float, anchors: List[Tuple[float, float]]) -> i
 class MariNetworkSimulator:
     """Discrete-event model of mari's TSCH link layer for the DotBot simulator.
 
-    Selects one of mari's real fixed schedules from the mari-mode fleet size
-    (or an explicit ``network.schedule`` override), assigns each mari-mode bot
-    a real dedicated uplink cell in schedule order, and delivers frames at the
-    delay to that bot's next assigned cell — a real ``U`` cell for uplink, the
-    nearest ``D`` cell after it for downlink. PDR is drawn per direction, per
+    Delivers frames at the delay to a bot's assigned cell — a real ``U`` cell
+    for uplink, the nearest ``D`` cell after it for downlink — on a schedule
+    picked from mari's real fixed schedules. PDR is drawn per direction, per
     delivery attempt (mari has no link-layer ACK/retransmission, so every
     attempt is single-shot), from each bot's live distance to the gateway —
     never from the fleet size or the schedule.
+
+    A bot has no assigned cell until :meth:`assign_cell` is called for it —
+    driven by :class:`MariAssociationSimulator` reporting a completed join,
+    via the :class:`MariSimulator` facade that owns both. Frames for a
+    not-yet-assigned bot are silently dropped, matching a real unjoined node
+    having no cell to transmit in.
     """
 
     def __init__(
         self,
+        schedule: MariSchedule,
         settings: SimulatedNetworkSettings,
         dotbots: List["DotBotSimulator"],
-        mari_indices: List[int],
+        enqueue: Callable[[float, Callable], None],
         on_frame_received: Callable,
     ):
+        self._schedule = schedule
         self._settings = settings
         self._dotbots = dotbots
+        self._enqueue = enqueue
         self._on_frame_received = on_frame_received
-        self._heap: list = []
-        self._seq = 0
-        self._cond = threading.Condition()
-        self._stop_event = threading.Event()
-        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._slot_duration_ms = settings.slot_duration_ms or schedule.slot_duration_ms
 
-        self._schedule: MariSchedule = (
-            select_schedule(len(mari_indices), mari_dir=settings.mari_dir)
-            if settings.schedule is None
-            else _load_named_schedule(settings.schedule, settings.mari_dir)
-        )
-        if len(mari_indices) > self._schedule.max_nodes:
-            raise ValueError(
-                f"mari schedule {self._schedule.name!r} supports at most "
-                f"{self._schedule.max_nodes} nodes, but {len(mari_indices)} "
-                "dotbots are in mari mode"
-            )
-        self._slot_duration_ms = settings.slot_duration_ms or self._schedule.slot_duration_ms
-
-        uplink_cells = self._schedule.uplink_cell_indices()
-        downlink_cells = self._schedule.downlink_cell_indices()
-        self._uplink_cell = {index: uplink_cells[i] for i, index in enumerate(mari_indices)}
-        self._downlink_cell = {
-            index: _next_downlink_cell(uplink_cells[i], downlink_cells)
-            for i, index in enumerate(mari_indices)
-        }
+        self._uplink_cells = schedule.uplink_cell_indices()
+        self._downlink_cells = schedule.downlink_cell_indices()
+        self._next_uplink_i = 0
+        # Guards the three attributes above/below against the facade thread's
+        # assign_cell() racing an external caller thread's schedule_uplink/
+        # schedule_downlink (unlike phase 1, cell assignment now happens after
+        # start() rather than once, eagerly, before any thread runs).
+        self._lock = threading.Lock()
+        self._uplink_cell: dict[int, int] = {}
+        self._downlink_cell: dict[int, int] = {}
 
         overhead_s = self._calibrated_overhead_ms() / 1000
         self._uplink_overhead_s = overhead_s
         self._downlink_overhead_s = overhead_s
+
+    def assign_cell(self, dotbot_index: int) -> None:
+        """Give a just-joined bot the next available uplink cell, in schedule
+        order — mirrors scheduler.c's "first available U cell" semantics."""
+        with self._lock:
+            if self._next_uplink_i >= len(self._uplink_cells):
+                raise ValueError(
+                    f"mari schedule {self._schedule.name!r} has only "
+                    f"{len(self._uplink_cells)} uplink cells, all already assigned"
+                )
+            uplink_cell = self._uplink_cells[self._next_uplink_i]
+            self._next_uplink_i += 1
+            self._uplink_cell[dotbot_index] = uplink_cell
+            self._downlink_cell[dotbot_index] = _next_downlink_cell(
+                uplink_cell, self._downlink_cells
+            )
 
     def _calibrated_overhead_ms(self) -> float:
         """Extra per-direction delay an empirical mari campaign's measured RTT
@@ -798,27 +834,11 @@ class MariNetworkSimulator:
         theoretical_one_way_p50 = self._schedule.slotframe_ms / 2
         return max(0.0, measured_rtt_p50 / 2 - theoretical_one_way_p50)
 
-    def start(self):
-        self._thread.start()
-
-    def stop(self):
-        self._stop_event.set()
-        with self._cond:
-            self._cond.notify_all()
-        self._thread.join()
-
     def _cell_delay_s(self, cell_index: int) -> float:
         slotframe_s = self._schedule.slotframe_ms / 1000
         cell_offset_s = cell_index * self._slot_duration_ms / 1000
         phase = time.monotonic() % slotframe_s
         return (cell_offset_s - phase) % slotframe_s
-
-    def _enqueue(self, delay_s: float, fn: Callable):
-        delivery = time.monotonic() + delay_s
-        with self._cond:
-            heapq.heappush(self._heap, (delivery, self._seq, fn))
-            self._seq += 1
-            self._cond.notify()
 
     def _pdr_percent(self, dotbot_index: int, flat_default: int) -> int:
         anchors = self._settings.pdr_by_distance_m
@@ -835,10 +855,14 @@ class MariNetworkSimulator:
         return _interpolate_pdr(distance_m, anchors)
 
     def schedule_uplink(self, frame, dotbot_index: int):
+        with self._lock:
+            uplink_cell = self._uplink_cell.get(dotbot_index)
+        if uplink_cell is None:
+            return  # not joined yet — no assigned cell to send in
         if random.randint(0, 100) > self._pdr_percent(dotbot_index, self._settings.uplink_pdr):
             return
         delay = (
-            self._cell_delay_s(self._uplink_cell[dotbot_index])
+            self._cell_delay_s(uplink_cell)
             + self._uplink_overhead_s
             + self._settings.mqtt_latency_ms / 1000
         )
@@ -847,15 +871,213 @@ class MariNetworkSimulator:
     def schedule_downlink(
         self, bytes_: bytes, dotbot: "DotBotSimulator", dotbot_index: int
     ):
+        with self._lock:
+            downlink_cell = self._downlink_cell.get(dotbot_index)
+        if downlink_cell is None:
+            return  # not joined yet — no assigned cell to receive in
         if random.randint(0, 100) > self._pdr_percent(dotbot_index, self._settings.downlink_pdr):
             return
         frame = Frame.from_bytes(bytes_)
         delay = (
-            self._cell_delay_s(self._downlink_cell[dotbot_index])
+            self._cell_delay_s(downlink_cell)
             + self._downlink_overhead_s
             + self._settings.mqtt_latency_ms / 1000
         )
         self._enqueue(delay, lambda: dotbot.queue.put_nowait(frame))
+
+
+class MariAssociationSimulator:
+    """Discrete-event model of mari's join/association state machine
+    (``IDLE -> SCANNING -> SYNCED -> JOINING -> JOINED``,
+    ``repos/mari/firmware/mari/association.c``).
+
+    Models the slotted-ALOHA contention on shared uplink (``S``) cells that
+    dominates real join/formation time under a "join storm" (many nodes
+    joining at once): every ``SYNCED`` node whose backoff has elapsed
+    attempts a join request in the same ``S``-cell tick; more than one
+    attempt in the same tick collides, doubling (up to
+    ``MARI_BACKOFF_N_MAX``) the backoff window for every collider. A node
+    that collides ``MARI_BACKOFF_MAX_STREAK`` times in a row at the max
+    window rescans instead of retrying forever.
+
+    Two simplifications relative to the firmware, made for a formation-time
+    *distribution* model rather than a byte-exact protocol replay: scanning
+    is a single random delay up to one slotframe (time to the first beacon a
+    node happens to see) rather than a full rolling beacon-channel scan, and
+    a collision is resolved immediately at the colliding ``S``-cell tick
+    rather than after the firmware's own ~1.5-slot join-response timeout —
+    both negligible next to the backoff windows and collision counts a join
+    storm actually produces at the reference swarm sizes. The 5 s
+    ``MARI_JOIN_TIMEOUT_SINCE_SYNCED`` wall-clock guard is not modeled either:
+    it is a rare-case backstop against a lost gateway in real firmware, not a
+    driver of the typical formation-time shape this class targets.
+    """
+
+    def __init__(
+        self,
+        schedule: MariSchedule,
+        mari_indices: List[int],
+        enqueue: Callable[[float, Callable], None],
+        on_joined: Callable[[int], None],
+    ):
+        self._enqueue = enqueue
+        self._on_joined = on_joined
+        self._slot_duration_s = schedule.slot_duration_ms / 1000
+        self._slotframe_s = schedule.slotframe_ms / 1000
+        self._shared_uplink_offsets_s = tuple(
+            cell * self._slot_duration_s for cell in schedule.shared_uplink_cell_indices()
+        )
+        if not self._shared_uplink_offsets_s:
+            raise ValueError(f"mari schedule {schedule.name!r} has no shared-uplink (S) cells")
+        self._nodes = {index: _AssocNodeState() for index in mari_indices}
+        self._tick_running = False
+
+    def start(self):
+        for index in self._nodes:
+            self._begin_scanning(index)
+
+    def _begin_scanning(self, index: int):
+        self._nodes[index].state = MariJoinState.SCANNING
+        delay_s = random.uniform(0, self._slotframe_s)
+        self._enqueue(delay_s, lambda: self._handle_synced(index))
+
+    def _handle_synced(self, index: int):
+        node = self._nodes[index]
+        node.state = MariJoinState.SYNCED
+        self._init_backoff(node)
+        self._ensure_tick_scheduled()
+
+    def _init_backoff(self, node: _AssocNodeState):
+        node.backoff_n = MARI_BACKOFF_N_MIN
+        node.consecutive_max_backoff = 0
+        node.backoff_remaining = random.randint(0, (1 << node.backoff_n) - 1)
+
+    def _delay_to_next_shared_uplink(self) -> float:
+        phase = time.monotonic() % self._slotframe_s
+        return min((offset - phase) % self._slotframe_s for offset in self._shared_uplink_offsets_s)
+
+    def _ensure_tick_scheduled(self):
+        if self._tick_running:
+            return
+        self._tick_running = True
+        self._enqueue(self._delay_to_next_shared_uplink(), self._tick)
+
+    def _tick(self):
+        ready = []
+        for index, node in self._nodes.items():
+            if node.state != MariJoinState.SYNCED:
+                continue
+            if node.backoff_remaining > 0:
+                node.backoff_remaining -= 1
+            else:
+                ready.append(index)
+
+        if len(ready) == 1:
+            index = ready[0]
+            self._nodes[index].state = MariJoinState.JOINING
+            timeout_s = MARI_JOINING_STATE_TIMEOUT_SLOTS * self._slot_duration_s
+            self._enqueue(timeout_s, lambda: self._handle_joined(index))
+        elif len(ready) > 1:
+            for index in ready:
+                self._handle_collision(index)
+
+        if any(node.state != MariJoinState.JOINED for node in self._nodes.values()):
+            self._enqueue(self._delay_to_next_shared_uplink(), self._tick)
+        else:
+            self._tick_running = False
+
+    def _handle_collision(self, index: int):
+        node = self._nodes[index]
+        node.backoff_n = min(node.backoff_n + 1, MARI_BACKOFF_N_MAX)
+        if node.backoff_n >= MARI_BACKOFF_N_MAX:
+            node.consecutive_max_backoff += 1
+        else:
+            node.consecutive_max_backoff = 0
+
+        if node.consecutive_max_backoff >= MARI_BACKOFF_MAX_STREAK:
+            self._begin_scanning(index)  # stuck: give up and rescan
+            return
+        node.backoff_remaining = random.randint(0, (1 << node.backoff_n) - 1)
+
+    def _handle_joined(self, index: int):
+        self._nodes[index].state = MariJoinState.JOINED
+        self._on_joined(index)
+
+
+class MariSimulator:
+    """Facade owning mari's steady-state network model
+    (:class:`MariNetworkSimulator`) and its join/association model
+    (:class:`MariAssociationSimulator`) behind one thread and one event heap,
+    so :class:`DotBotSimulatorCommunicationInterface` sees exactly one mari
+    simulator object rather than two independently-wired ones.
+
+    This is also where the two sub-models are coupled: a bot's frames only
+    reach :class:`MariNetworkSimulator`'s scheduling once
+    :class:`MariAssociationSimulator` reports that bot joined
+    (``on_joined=self._network.assign_cell``).
+    """
+
+    def __init__(
+        self,
+        settings: SimulatedNetworkSettings,
+        dotbots: List["DotBotSimulator"],
+        mari_indices: List[int],
+        on_frame_received: Callable,
+    ):
+        schedule: MariSchedule = (
+            select_schedule(len(mari_indices), mari_dir=settings.mari_dir)
+            if settings.schedule is None
+            else _load_named_schedule(settings.schedule, settings.mari_dir)
+        )
+        if len(mari_indices) > schedule.max_nodes:
+            raise ValueError(
+                f"mari schedule {schedule.name!r} supports at most "
+                f"{schedule.max_nodes} nodes, but {len(mari_indices)} "
+                "dotbots are in mari mode"
+            )
+
+        self._heap: list = []
+        self._seq = 0
+        self._cond = threading.Condition()
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+        self._network = MariNetworkSimulator(
+            schedule=schedule,
+            settings=settings,
+            dotbots=dotbots,
+            enqueue=self._enqueue,
+            on_frame_received=on_frame_received,
+        )
+        self._association = MariAssociationSimulator(
+            schedule=schedule,
+            mari_indices=mari_indices,
+            enqueue=self._enqueue,
+            on_joined=self._network.assign_cell,
+        )
+
+    def start(self):
+        self._thread.start()
+        self._association.start()
+
+    def stop(self):
+        self._stop_event.set()
+        with self._cond:
+            self._cond.notify_all()
+        self._thread.join()
+
+    def schedule_uplink(self, frame, dotbot_index: int):
+        self._network.schedule_uplink(frame, dotbot_index)
+
+    def schedule_downlink(self, bytes_: bytes, dotbot: "DotBotSimulator", dotbot_index: int):
+        self._network.schedule_downlink(bytes_, dotbot, dotbot_index)
+
+    def _enqueue(self, delay_s: float, fn: Callable):
+        delivery = time.monotonic() + delay_s
+        with self._cond:
+            heapq.heappush(self._heap, (delivery, self._seq, fn))
+            self._seq += 1
+            self._cond.notify()
 
     def _run(self):
         with self._cond:
@@ -926,7 +1148,7 @@ class DotBotSimulatorCommunicationInterface:
             i for i, m in enumerate(self._dotbot_modes) if m == SimulatedNetworkMode.MARI
         ]
         if mari_indices:
-            self._mari = MariNetworkSimulator(
+            self._mari = MariSimulator(
                 settings=self._network,
                 dotbots=self.dotbots,
                 mari_indices=mari_indices,
