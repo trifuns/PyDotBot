@@ -255,13 +255,19 @@ def triangle_waypoints(scale: float, arena_size: int, _) -> list[dict]:
     return points
 
 
-def circle_waypoints(scale: float, arena_size: int, n_points: int) -> list[dict]:
-    """Approximate a circle with n_points waypoints centered in the arena."""
+def circle_waypoints(
+    scale: float, arena_size: int, n_points: int, phase_deg: float = 0.0
+) -> list[dict]:
+    """Approximate a circle with n_points waypoints centered in the arena.
+
+    phase_deg rotates the whole sequence's starting angle; 0 (default) starts
+    due east of center, matching every prior caller's behavior exactly.
+    """
     cx, cy = _center(arena_size)
     r = scale / 2
     points = []
     for i in range(n_points + 1):
-        angle = math.radians(i * 360 / n_points)
+        angle = math.radians(phase_deg + i * 360 / n_points)
         points.append(
             {
                 "x": round(cx + r * math.cos(angle)),
