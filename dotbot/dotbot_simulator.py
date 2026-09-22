@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from enum import Enum
 from math import atan2, cos, hypot, pi, sin, sqrt
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple, Union
 
 import toml
 from dotbot_utils.protocol import Frame, Header, Packet
@@ -90,6 +90,34 @@ class _AssocNodeState:
     backoff_n: int = -1
     backoff_remaining: int = 0
     consecutive_max_backoff: int = 0
+
+
+@dataclass(frozen=True)
+class MariJoinEvent:
+    """A bot's join/association state changed."""
+
+    bot_index: int
+    ts: float
+    state: MariJoinState
+
+
+@dataclass(frozen=True)
+class MariDeliveryEvent:
+    """A single uplink/downlink delivery attempt was decided (may be a drop)."""
+
+    bot_index: int
+    ts: float
+    direction: str  # "uplink" or "downlink"
+    delivered: bool
+    delay_s: Optional[float]  # None when not delivered — there is nothing to time
+
+
+#: What a MariSimulator's optional on_event callback receives. Fired
+#: synchronously at decision time, from whichever thread made the call
+#: (MariDeliveryEvent: the external caller thread that invoked
+#: schedule_uplink/schedule_downlink; MariJoinEvent: the facade's own event
+#: thread) — a callback must be thread-safe on its own terms.
+MariEvent = Union[MariJoinEvent, MariDeliveryEvent]
 
 # Feature order must match utils/sim_to_real/train_gru.py FEATURE_COLS
 GRU_FEATURE_COLS = [
@@ -782,12 +810,14 @@ class MariNetworkSimulator:
         dotbots: List["DotBotSimulator"],
         enqueue: Callable[[float, Callable], None],
         on_frame_received: Callable,
+        on_event: Optional[Callable[[MariEvent], None]] = None,
     ):
         self._schedule = schedule
         self._settings = settings
         self._dotbots = dotbots
         self._enqueue = enqueue
         self._on_frame_received = on_frame_received
+        self._on_event = on_event
         self._slot_duration_ms = settings.slot_duration_ms or schedule.slot_duration_ms
 
         self._uplink_cells = schedule.uplink_cell_indices()
@@ -854,18 +884,33 @@ class MariNetworkSimulator:
         )
         return _interpolate_pdr(distance_m, anchors)
 
+    def _emit(self, dotbot_index: int, direction: str, delivered: bool, delay_s: Optional[float]):
+        if self._on_event is not None:
+            self._on_event(
+                MariDeliveryEvent(
+                    bot_index=dotbot_index,
+                    ts=time.monotonic(),
+                    direction=direction,
+                    delivered=delivered,
+                    delay_s=delay_s,
+                )
+            )
+
     def schedule_uplink(self, frame, dotbot_index: int):
         with self._lock:
             uplink_cell = self._uplink_cell.get(dotbot_index)
         if uplink_cell is None:
             return  # not joined yet — no assigned cell to send in
-        if random.randint(0, 100) > self._pdr_percent(dotbot_index, self._settings.uplink_pdr):
+        delivered = random.randint(0, 100) <= self._pdr_percent(dotbot_index, self._settings.uplink_pdr)
+        if not delivered:
+            self._emit(dotbot_index, "uplink", delivered=False, delay_s=None)
             return
         delay = (
             self._cell_delay_s(uplink_cell)
             + self._uplink_overhead_s
             + self._settings.mqtt_latency_ms / 1000
         )
+        self._emit(dotbot_index, "uplink", delivered=True, delay_s=delay)
         self._enqueue(delay, lambda: self._on_frame_received(frame))
 
     def schedule_downlink(
@@ -875,7 +920,9 @@ class MariNetworkSimulator:
             downlink_cell = self._downlink_cell.get(dotbot_index)
         if downlink_cell is None:
             return  # not joined yet — no assigned cell to receive in
-        if random.randint(0, 100) > self._pdr_percent(dotbot_index, self._settings.downlink_pdr):
+        delivered = random.randint(0, 100) <= self._pdr_percent(dotbot_index, self._settings.downlink_pdr)
+        if not delivered:
+            self._emit(dotbot_index, "downlink", delivered=False, delay_s=None)
             return
         frame = Frame.from_bytes(bytes_)
         delay = (
@@ -883,6 +930,7 @@ class MariNetworkSimulator:
             + self._downlink_overhead_s
             + self._settings.mqtt_latency_ms / 1000
         )
+        self._emit(dotbot_index, "downlink", delivered=True, delay_s=delay)
         self._enqueue(delay, lambda: dotbot.queue.put_nowait(frame))
 
 
@@ -919,9 +967,11 @@ class MariAssociationSimulator:
         mari_indices: List[int],
         enqueue: Callable[[float, Callable], None],
         on_joined: Callable[[int], None],
+        on_event: Optional[Callable[[MariEvent], None]] = None,
     ):
         self._enqueue = enqueue
         self._on_joined = on_joined
+        self._on_event = on_event
         self._slot_duration_s = schedule.slot_duration_ms / 1000
         self._slotframe_s = schedule.slotframe_ms / 1000
         self._shared_uplink_offsets_s = tuple(
@@ -932,18 +982,24 @@ class MariAssociationSimulator:
         self._nodes = {index: _AssocNodeState() for index in mari_indices}
         self._tick_running = False
 
+    def _emit(self, index: int, state: MariJoinState):
+        if self._on_event is not None:
+            self._on_event(MariJoinEvent(bot_index=index, ts=time.monotonic(), state=state))
+
     def start(self):
         for index in self._nodes:
             self._begin_scanning(index)
 
     def _begin_scanning(self, index: int):
         self._nodes[index].state = MariJoinState.SCANNING
+        self._emit(index, MariJoinState.SCANNING)
         delay_s = random.uniform(0, self._slotframe_s)
         self._enqueue(delay_s, lambda: self._handle_synced(index))
 
     def _handle_synced(self, index: int):
         node = self._nodes[index]
         node.state = MariJoinState.SYNCED
+        self._emit(index, MariJoinState.SYNCED)
         self._init_backoff(node)
         self._ensure_tick_scheduled()
 
@@ -975,6 +1031,7 @@ class MariAssociationSimulator:
         if len(ready) == 1:
             index = ready[0]
             self._nodes[index].state = MariJoinState.JOINING
+            self._emit(index, MariJoinState.JOINING)
             timeout_s = MARI_JOINING_STATE_TIMEOUT_SLOTS * self._slot_duration_s
             self._enqueue(timeout_s, lambda: self._handle_joined(index))
         elif len(ready) > 1:
@@ -1001,6 +1058,7 @@ class MariAssociationSimulator:
 
     def _handle_joined(self, index: int):
         self._nodes[index].state = MariJoinState.JOINED
+        self._emit(index, MariJoinState.JOINED)
         self._on_joined(index)
 
 
@@ -1023,6 +1081,7 @@ class MariSimulator:
         dotbots: List["DotBotSimulator"],
         mari_indices: List[int],
         on_frame_received: Callable,
+        on_event: Optional[Callable[[MariEvent], None]] = None,
     ):
         schedule: MariSchedule = (
             select_schedule(len(mari_indices), mari_dir=settings.mari_dir)
@@ -1048,12 +1107,14 @@ class MariSimulator:
             dotbots=dotbots,
             enqueue=self._enqueue,
             on_frame_received=on_frame_received,
+            on_event=on_event,
         )
         self._association = MariAssociationSimulator(
             schedule=schedule,
             mari_indices=mari_indices,
             enqueue=self._enqueue,
             on_joined=self._network.assign_cell,
+            on_event=on_event,
         )
 
     def start(self):
@@ -1125,7 +1186,12 @@ def resolve_init_state_path(path: str) -> str:
 class DotBotSimulatorCommunicationInterface:
     """Bidirectional serial interface to control simulated robots"""
 
-    def __init__(self, on_frame_received: Callable, simulator_init_state: str):
+    def __init__(
+        self,
+        on_frame_received: Callable,
+        simulator_init_state: str,
+        on_mari_event: Optional[Callable[[MariEvent], None]] = None,
+    ):
         self.queue = queue.Queue()
         self.on_frame_received = on_frame_received
         self._stp_event = threading.Event()
@@ -1153,6 +1219,7 @@ class DotBotSimulatorCommunicationInterface:
                 dotbots=self.dotbots,
                 mari_indices=mari_indices,
                 on_frame_received=self.on_frame_received,
+                on_event=on_mari_event,
             )
 
         self.logger = LOGGER.bind(context=__name__)
